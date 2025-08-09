@@ -1,10 +1,10 @@
 ;; Enhanced Staking DAO Contract
-;; Features: Treasury Management, Reward Distribution, Advanced Proposals, Quadratic Voting, Automated Execution
+;; Features: Treasury Management, Reward Distribution, Advanced Proposals, Quadratic Voting, Automated Execution, Time-Weighted Voting
 
 ;; ===== CONSTANTS AND BASIC SETUP =====
 (define-constant contract-owner tx-sender)
 (define-constant contract-name "TrumDAO")
-(define-constant contract-version "1.0.0")
+(define-constant contract-version "1.1.0")
 
 (define-constant err-not-authorized (err u100))
 (define-constant err-invalid-amount (err u101))
@@ -46,6 +46,11 @@
 (define-constant min-execution-delay u10)
 (define-constant max-execution-delay u14400)  ;; ~100 days
 
+;; Time-weighted voting constants
+(define-constant min-time-weight u100)  ;; Base weight (100%)
+(define-constant max-time-weight u300)  ;; Maximum weight (300%)
+(define-constant time-weight-blocks u14400)  ;; Blocks to reach max weight (~100 days)
+
 ;; ===== DATA VARIABLES =====
 (define-data-var proposal-counter uint u0)
 (define-data-var treasury-proposal-counter uint u0)
@@ -66,12 +71,17 @@
 (define-map participation-tier principal (tuple (level uint) (total-votes uint) (proposals-created uint)))
 (define-map delegations principal principal)
 
+;; NEW: Time-weighted voting system
+(define-map stake-history principal (tuple (first-stake-block uint) (total-stake-duration uint) (last-stake-block uint)))
+(define-map time-weighted-votes (tuple (proposal-id uint) (voter principal)) (tuple (base-power uint) (time-weight uint) (final-power uint)))
+
 ;; Enhanced proposal system with types
 (define-map proposal-types (string-utf8 20) (tuple 
   (min-stake-required uint)
   (voting-period uint)
   (execution-delay uint)
-  (quadratic-enabled bool)))
+  (quadratic-enabled bool)
+  (time-weighted-enabled bool)))
 
 (define-map proposals uint (tuple 
   (title (string-utf8 50))
@@ -166,6 +176,53 @@
 
 (define-private (validate-reward-duration (duration uint))
   (and (> duration u0) (<= duration u525600))) ;; Max ~1 year
+
+;; ===== TIME-WEIGHTED VOTING FUNCTIONS =====
+;; Calculate time-based voting weight
+(define-private (calculate-time-weight (user principal))
+  (let ((history (map-get? stake-history user)))
+    (match history
+      hist-data
+      (let ((first-stake (get first-stake-block hist-data))
+            (current-block stacks-block-height)
+            (stake-duration (if (>= current-block first-stake) 
+                              (- current-block first-stake) 
+                              u0)))
+        (if (>= stake-duration time-weight-blocks)
+            max-time-weight
+            (+ min-time-weight 
+               (/ (* (- max-time-weight min-time-weight) stake-duration) 
+                  time-weight-blocks))))
+      min-time-weight)))
+
+;; Update stake history when user stakes
+(define-private (update-stake-history (user principal))
+  (let ((existing-history (map-get? stake-history user)))
+    (match existing-history
+      hist-data
+      ;; User has staked before, update duration
+      (let ((total-duration (+ (get total-stake-duration hist-data) 
+                              (if (>= stacks-block-height (get last-stake-block hist-data))
+                                  (- stacks-block-height (get last-stake-block hist-data))
+                                  u0))))
+        (map-set stake-history user
+          (tuple 
+            (first-stake-block (get first-stake-block hist-data))
+            (total-stake-duration total-duration)
+            (last-stake-block stacks-block-height))))
+      ;; First time staking
+      (map-set stake-history user
+        (tuple 
+          (first-stake-block stacks-block-height)
+          (total-stake-duration u0)
+          (last-stake-block stacks-block-height))))
+    (ok true)))
+
+;; Calculate final vote power with time weighting
+(define-private (calculate-time-weighted-vote-power (user principal) (base-power uint))
+  (let ((time-weight (calculate-time-weight user))
+        (weighted-power (/ (* base-power time-weight) u100)))
+    (tuple (base-power base-power) (time-weight time-weight) (final-power weighted-power))))
 
 ;; ===== UTILITY FUNCTIONS (DEFINED FIRST) =====
 (define-private (calculate-weight (stake-amount uint) (lock-duration uint))
@@ -389,13 +446,14 @@
       (ok true))
     (ok true)))
 
-;; Initialize default proposal types
+;; Initialize default proposal types with time-weighted voting
 (define-private (init-proposal-types)
   (begin
-    (map-set proposal-types u"standard" (tuple (min-stake-required u100000) (voting-period u1440) (execution-delay u144) (quadratic-enabled false)))
-    (map-set proposal-types u"treasury" (tuple (min-stake-required u500000) (voting-period u2880) (execution-delay u288) (quadratic-enabled true)))
-    (map-set proposal-types u"parameter" (tuple (min-stake-required u1000000) (voting-period u4320) (execution-delay u432) (quadratic-enabled true)))
-    (map-set proposal-types u"emergency" (tuple (min-stake-required u2000000) (voting-period u720) (execution-delay u72) (quadratic-enabled false)))
+    (map-set proposal-types u"standard" (tuple (min-stake-required u100000) (voting-period u1440) (execution-delay u144) (quadratic-enabled false) (time-weighted-enabled false)))
+    (map-set proposal-types u"treasury" (tuple (min-stake-required u500000) (voting-period u2880) (execution-delay u288) (quadratic-enabled true) (time-weighted-enabled true)))
+    (map-set proposal-types u"parameter" (tuple (min-stake-required u1000000) (voting-period u4320) (execution-delay u432) (quadratic-enabled true) (time-weighted-enabled true)))
+    (map-set proposal-types u"emergency" (tuple (min-stake-required u2000000) (voting-period u720) (execution-delay u72) (quadratic-enabled false) (time-weighted-enabled false)))
+    (map-set proposal-types u"long-term" (tuple (min-stake-required u750000) (voting-period u7200) (execution-delay u720) (quadratic-enabled false) (time-weighted-enabled true)))
     true))
 
 ;; ===== ADMIN FUNCTIONS =====
@@ -410,7 +468,7 @@
     (ok (var-set emergency-state (not (var-get emergency-state))))))
 
 ;; ===== PROPOSAL TYPE MANAGEMENT =====
-(define-public (add-proposal-type (type-name (string-utf8 20)) (minimum-stake uint) (voting-period uint) (execution-delay uint) (quadratic bool))
+(define-public (add-proposal-type (type-name (string-utf8 20)) (minimum-stake uint) (voting-period uint) (execution-delay uint) (quadratic bool) (time-weighted bool))
   (begin
     (asserts! (is-admin) err-not-authorized)
     (asserts! (validate-type-name type-name) err-invalid-string)
@@ -422,7 +480,8 @@
         (min-stake-required minimum-stake)
         (voting-period voting-period)
         (execution-delay execution-delay)
-        (quadratic-enabled quadratic))))))
+        (quadratic-enabled quadratic)
+        (time-weighted-enabled time-weighted))))))
 
 ;; ===== STAKING FUNCTIONS =====
 (define-public (stake-basic (amount uint))
@@ -434,6 +493,7 @@
         success (begin
           (map-set stakes tx-sender (tuple (amount amount) (unlock-block unlock)))
           (try! (update-user-stats amount))
+          (unwrap-panic (update-stake-history tx-sender))
           (unwrap! (calculate-staking-rewards tx-sender) err-execution-failed)
           (ok "Staked successfully"))
         error err-execution-failed))))
@@ -450,6 +510,7 @@
           (map-set stakes tx-sender (tuple (amount amount) (unlock-block unlock)))
           (map-set stake-weights tx-sender weight)
           (try! (update-user-stats amount))
+          (unwrap-panic (update-stake-history tx-sender))
           (unwrap! (calculate-staking-rewards tx-sender) err-execution-failed)
           (ok "Staked with lock successfully"))
         error err-execution-failed))))
@@ -670,6 +731,49 @@
       (var-set proposal-counter proposal-id)
       (ok proposal-id))))
 
+;; ===== TIME-WEIGHTED VOTING FUNCTIONS =====
+(define-public (time-weighted-vote (proposal-id uint) (support bool))
+  (begin
+    (asserts! (> proposal-id u0) err-proposal-not-found)
+    (let ((stake-info (unwrap! (map-get? stakes tx-sender) err-no-stake-found))
+          (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found)))
+      (asserts! (is-eq (get status proposal) u"active") err-proposal-not-active)
+      (asserts! (<= stacks-block-height (get end-block proposal)) err-voting-period-ended)
+      
+      ;; Check if proposal type supports time-weighted voting
+      (let ((prop-type (unwrap! (map-get? proposal-types (get proposal-type proposal)) err-invalid-proposal-type)))
+        (asserts! (get time-weighted-enabled prop-type) err-quadratic-not-enabled)
+        
+        ;; Calculate time-weighted vote power
+        (let ((tier-level (get-user-tier-level tx-sender))
+              (stake-amount (get amount stake-info))
+              (base-power (calculate-vote-power stake-amount tier-level))
+              (time-weighted-power (calculate-time-weighted-vote-power tx-sender base-power))
+              (final-power (get final-power time-weighted-power))
+              (current-totals (default-to 
+                               (tuple (votes-for u0) (votes-against u0) (total-voters u0))
+                               (map-get? proposal-vote-totals proposal-id))))
+          
+          ;; Record the time-weighted vote
+          (map-set time-weighted-votes (tuple (proposal-id proposal-id) (voter tx-sender)) time-weighted-power)
+          (map-set proposal-votes (tuple (proposal-id proposal-id) (voter tx-sender))
+            (tuple (vote-power final-power) (support support)))
+          
+          ;; Update vote totals with time-weighted power
+          (if support
+              (map-set proposal-vote-totals proposal-id
+                (tuple 
+                  (votes-for (+ (get votes-for current-totals) final-power))
+                  (votes-against (get votes-against current-totals))
+                  (total-voters (+ (get total-voters current-totals) u1))))
+              (map-set proposal-vote-totals proposal-id
+                (tuple 
+                  (votes-for (get votes-for current-totals))
+                  (votes-against (+ (get votes-against current-totals) final-power))
+                  (total-voters (+ (get total-voters current-totals) u1)))))
+          
+          (ok "Time-weighted vote recorded successfully"))))))
+
 ;; ===== VOTING FUNCTIONS (COMPLETELY FIXED) =====
 (define-public (vote (proposal-id uint) (support bool))
   (begin
@@ -679,32 +783,36 @@
       (asserts! (is-eq (get status proposal) u"active") err-proposal-not-active)
       (asserts! (<= stacks-block-height (get end-block proposal)) err-voting-period-ended)
       
-      ;; FIXED: Calculate vote power with safe tier level retrieval
-      (let ((tier-level (get-user-tier-level tx-sender))
-            (stake-amount (get amount stake-info))
-            (vote-power (calculate-vote-power stake-amount tier-level))
-            (current-totals (default-to 
-                             (tuple (votes-for u0) (votes-against u0) (total-voters u0))
-                             (map-get? proposal-vote-totals proposal-id))))
-        
-        ;; Record the vote
-        (map-set proposal-votes (tuple (proposal-id proposal-id) (voter tx-sender))
-          (tuple (vote-power vote-power) (support support)))
-        
-        ;; Update vote totals
-        (if support
-            (map-set proposal-vote-totals proposal-id
-              (tuple 
-                (votes-for (+ (get votes-for current-totals) vote-power))
-                (votes-against (get votes-against current-totals))
-                (total-voters (+ (get total-voters current-totals) u1))))
-            (map-set proposal-vote-totals proposal-id
-              (tuple 
-                (votes-for (get votes-for current-totals))
-                (votes-against (+ (get votes-against current-totals) vote-power))
-                (total-voters (+ (get total-voters current-totals) u1)))))
-        
-        (ok "Vote recorded successfully")))))
+      ;; Check if proposal type supports time-weighted voting and redirect if so
+      (let ((prop-type (unwrap! (map-get? proposal-types (get proposal-type proposal)) err-invalid-proposal-type)))
+        (if (get time-weighted-enabled prop-type)
+            (time-weighted-vote proposal-id support)
+            ;; Standard voting logic
+            (let ((tier-level (get-user-tier-level tx-sender))
+                  (stake-amount (get amount stake-info))
+                  (vote-power (calculate-vote-power stake-amount tier-level))
+                  (current-totals (default-to 
+                                   (tuple (votes-for u0) (votes-against u0) (total-voters u0))
+                                   (map-get? proposal-vote-totals proposal-id))))
+              
+              ;; Record the vote
+              (map-set proposal-votes (tuple (proposal-id proposal-id) (voter tx-sender))
+                (tuple (vote-power vote-power) (support support)))
+              
+              ;; Update vote totals
+              (if support
+                  (map-set proposal-vote-totals proposal-id
+                    (tuple 
+                      (votes-for (+ (get votes-for current-totals) vote-power))
+                      (votes-against (get votes-against current-totals))
+                      (total-voters (+ (get total-voters current-totals) u1))))
+                  (map-set proposal-vote-totals proposal-id
+                    (tuple 
+                      (votes-for (get votes-for current-totals))
+                      (votes-against (+ (get votes-against current-totals) vote-power))
+                      (total-voters (+ (get total-voters current-totals) u1)))))
+              
+              (ok "Vote recorded successfully")))))))
 
 ;; ===== DELEGATION FUNCTIONS =====
 (define-public (delegate-to (delegate principal))
@@ -768,6 +876,26 @@
 
 (define-read-only (get-emergency-state)
   (var-get emergency-state))
+
+;; NEW: Time-weighted voting read-only functions
+(define-read-only (get-stake-history (user principal))
+  (map-get? stake-history user))
+
+(define-read-only (get-time-weight (user principal))
+  (calculate-time-weight user))
+
+(define-read-only (get-time-weighted-vote (proposal-id uint) (voter principal))
+  (map-get? time-weighted-votes (tuple (proposal-id proposal-id) (voter voter))))
+
+(define-read-only (calculate-user-time-weighted-power (user principal))
+  (let ((stake-info (map-get? stakes user)))
+    (match stake-info
+      stake-data
+      (let ((tier-level (get-user-tier-level user))
+            (stake-amount (get amount stake-data))
+            (base-power (calculate-vote-power stake-amount tier-level)))
+        (some (calculate-time-weighted-vote-power user base-power)))
+      none)))
 
 ;; Initialize the contract
 (begin
