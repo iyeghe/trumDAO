@@ -1,10 +1,10 @@
 ;; Enhanced Staking DAO Contract
-;; Features: Treasury Management, Reward Distribution, Advanced Proposals, Quadratic Voting, Automated Execution, Time-Weighted Voting
+;; Features: Treasury Management, Reward Distribution, Advanced Proposals, Quadratic Voting, Automated Execution, Time-Weighted Voting, Dynamic Execution Layer
 
 ;; ===== CONSTANTS AND BASIC SETUP =====
 (define-constant contract-owner tx-sender)
 (define-constant contract-name "TrumDAO")
-(define-constant contract-version "1.1.0")
+(define-constant contract-version "1.2.0")
 
 (define-constant err-not-authorized (err u100))
 (define-constant err-invalid-amount (err u101))
@@ -32,6 +32,10 @@
 (define-constant err-circular-delegation (err u123))
 (define-constant err-invalid-string (err u124))
 (define-constant err-invalid-duration (err u125))
+(define-constant err-action-not-found (err u126))
+(define-constant err-invalid-action-type (err u127))
+(define-constant err-parameter-out-of-bounds (err u128))
+(define-constant err-contract-call-failed (err u129))
 
 ;; Staking constants
 (define-constant min-stake u100000)
@@ -57,6 +61,7 @@
 (define-data-var emergency-state bool false)
 (define-data-var total-treasury-balance uint u0)
 (define-data-var reward-pool-counter uint u0)
+(define-data-var action-counter uint u0)
 
 ;; ===== MAPS =====
 ;; Basic admin and user management
@@ -75,6 +80,29 @@
 (define-map stake-history principal (tuple (first-stake-block uint) (total-stake-duration uint) (last-stake-block uint)))
 (define-map time-weighted-votes (tuple (proposal-id uint) (voter principal)) (tuple (base-power uint) (time-weight uint) (final-power uint)))
 
+;; NEW: Dynamic Execution System
+(define-map execution-actions uint (tuple 
+  (action-type (string-utf8 30))
+  (target-contract (optional principal))
+  (function-name (string-utf8 50))
+  (parameter-types (list 5 (string-utf8 10)))
+  (requires-admin bool)
+  (enabled bool)))
+
+(define-map contract-parameters (string-utf8 30) (tuple 
+  (current-value uint)
+  (min-value uint)
+  (max-value uint)
+  (last-updated uint)
+  (update-count uint)))
+
+(define-map execution-results uint (tuple
+  (proposal-id uint)
+  (action-id uint)
+  (success bool)
+  (result-data (string-utf8 200))
+  (executed-at uint)))
+
 ;; Enhanced proposal system with types
 (define-map proposal-types (string-utf8 20) (tuple 
   (min-stake-required uint)
@@ -83,6 +111,7 @@
   (quadratic-enabled bool)
   (time-weighted-enabled bool)))
 
+;; ENHANCED: Updated proposal structure for dynamic execution
 (define-map proposals uint (tuple 
   (title (string-utf8 50))
   (description (string-utf8 500))
@@ -93,7 +122,8 @@
   (min-votes uint)
   (proposal-type (string-utf8 20))
   (executable bool)
-  (execution-data (optional (tuple (contract principal) (function-name (string-utf8 50)) (parameters (list 5 uint)))))))
+  (execution-action-id (optional uint))
+  (execution-parameters (list 5 uint))))
 
 ;; Quadratic voting system
 (define-map quadratic-votes (tuple (proposal-id uint) (voter principal)) (tuple (vote-count uint) (cost uint)))
@@ -176,6 +206,213 @@
 
 (define-private (validate-reward-duration (duration uint))
   (and (> duration u0) (<= duration u525600))) ;; Max ~1 year
+
+(define-private (validate-parameter-value (value uint) (min-val uint) (max-val uint))
+  (and (>= value min-val) (<= value max-val)))
+
+;; ===== DYNAMIC EXECUTION SYSTEM =====
+
+;; Initialize predefined execution actions
+(define-private (init-execution-actions)
+  (begin
+    ;; Parameter update action
+    (map-set execution-actions u1 (tuple 
+      (action-type u"update-parameter")
+      (target-contract none)
+      (function-name u"update-contract-parameter")
+      (parameter-types (list u"string" u"uint"))
+      (requires-admin true)
+      (enabled true)))
+    
+    ;; Treasury transfer action
+    (map-set execution-actions u2 (tuple 
+      (action-type u"treasury-transfer")
+      (target-contract none)
+      (function-name u"execute-treasury-transfer")
+      (parameter-types (list u"principal" u"uint"))
+      (requires-admin true)
+      (enabled true)))
+    
+    ;; Reward distribution action
+    (map-set execution-actions u3 (tuple 
+      (action-type u"distribute-rewards")
+      (target-contract none)
+      (function-name u"execute-reward-distribution")
+      (parameter-types (list u"uint" u"uint"))
+      (requires-admin true)
+      (enabled true)))
+    
+    ;; Emergency action
+    (map-set execution-actions u4 (tuple 
+      (action-type u"emergency-action")
+      (target-contract none)
+      (function-name u"execute-emergency-action")
+      (parameter-types (list u"uint"))
+      (requires-admin true)
+      (enabled true)))
+    
+    ;; Staking parameter update
+    (map-set execution-actions u5 (tuple 
+      (action-type u"update-staking-params")
+      (target-contract none)
+      (function-name u"update-staking-parameters")
+      (parameter-types (list u"uint" u"uint"))
+      (requires-admin true)
+      (enabled true)))
+    
+    (var-set action-counter u5)
+    true))
+
+;; Add new execution action
+(define-public (add-execution-action (action-type (string-utf8 30)) (target-contract (optional principal)) (function-name (string-utf8 50)) (parameter-types (list 5 (string-utf8 10))) (requires-admin bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (validate-string-length action-type u30) err-invalid-string)
+    (asserts! (validate-string-length function-name u50) err-invalid-string)
+    (let ((action-id (+ (var-get action-counter) u1)))
+      (map-set execution-actions action-id (tuple 
+        (action-type action-type)
+        (target-contract target-contract)
+        (function-name function-name)
+        (parameter-types parameter-types)
+        (requires-admin requires-admin)
+        (enabled true)))
+      (var-set action-counter action-id)
+      (ok action-id))))
+
+;; Initialize contract parameters
+(define-private (init-contract-parameters)
+  (begin
+    (map-set contract-parameters u"min-stake" (tuple (current-value min-stake) (min-value u10000) (max-value u10000000) (last-updated stacks-block-height) (update-count u0)))
+    (map-set contract-parameters u"max-stake" (tuple (current-value max-stake) (min-value u1000000) (max-value u10000000000) (last-updated stacks-block-height) (update-count u0)))
+    (map-set contract-parameters u"min-voting-period" (tuple (current-value min-voting-period) (min-value u10) (max-value u1440) (last-updated stacks-block-height) (update-count u0)))
+    (map-set contract-parameters u"reward-rate" (tuple (current-value u1000) (min-value u100) (max-value u10000) (last-updated stacks-block-height) (update-count u0)))
+    true))
+
+;; ENHANCED: Dynamic proposal execution with action registry
+(define-private (execute-proposal-action (proposal (tuple (title (string-utf8 50)) (description (string-utf8 500)) (creator principal) (start-block uint) (end-block uint) (status (string-utf8 20)) (min-votes uint) (proposal-type (string-utf8 20)) (executable bool) (execution-action-id (optional uint)) (execution-parameters (list 5 uint)))))
+  (match (get execution-action-id proposal)
+    action-id
+    (let ((action-info (unwrap! (map-get? execution-actions action-id) err-action-not-found))
+          (parameters (get execution-parameters proposal)))
+      (asserts! (get enabled action-info) err-action-not-found)
+      (if (get requires-admin action-info)
+          (asserts! (is-admin) err-not-authorized)
+          true)
+      
+      ;; Execute based on action type
+      (let ((action-type (get action-type action-info)))
+        (dispatch-action action-type parameters)))  ;; Changed this line
+    (ok true)))
+
+(define-private (is-valid-action (action-type (string-utf8 30)))
+  (or (is-eq action-type u"update-parameter")
+      (is-eq action-type u"treasury-transfer")
+      (is-eq action-type u"distribute-rewards")
+      (is-eq action-type u"emergency-action")
+      (is-eq action-type u"update-staking-params")))
+
+(define-private (dispatch-action (action-type (string-utf8 30)) (parameters (list 5 uint)))
+  ;; Use let binding to create the validation condition
+  (let ((is-valid (or (is-eq action-type u"update-parameter")
+                      (is-eq action-type u"treasury-transfer")
+                      (is-eq action-type u"distribute-rewards")
+                      (is-eq action-type u"emergency-action")
+                      (is-eq action-type u"update-staking-params"))))
+    (asserts! is-valid err-invalid-action-type)
+    
+    (if (is-eq action-type u"update-parameter")
+        (execute-parameter-update parameters)
+        (if (is-eq action-type u"treasury-transfer")
+            (execute-treasury-transfer parameters)
+            (if (is-eq action-type u"distribute-rewards")
+                (execute-reward-distribution parameters)
+                (if (is-eq action-type u"emergency-action")
+                    (begin
+                      ;; Handle emergency action inline
+                      (var-set emergency-state true)
+                      (ok true))
+                    (execute-parameter-update parameters)))))))
+
+;; Parameter update execution
+(define-private (execute-parameter-update (parameters (list 5 uint)))
+  (let ((param-id (unwrap-panic (element-at parameters u0)))
+        (new-value (unwrap-panic (element-at parameters u1))))
+    (let ((param-name (if (is-eq param-id u1) u"min-stake"
+                         (if (is-eq param-id u2) u"max-stake"
+                            (if (is-eq param-id u3) u"min-voting-period"
+                               (if (is-eq param-id u4) u"reward-rate"
+                                  u"unknown"))))))
+      ;; Early return for unknown parameters
+      (asserts! (not (is-eq param-name u"unknown")) err-parameter-out-of-bounds)
+      
+      ;; Now we know param-name is valid, proceed with update
+      (let ((param-info (unwrap! (map-get? contract-parameters param-name) err-parameter-out-of-bounds)))
+        (asserts! (validate-parameter-value new-value (get min-value param-info) (get max-value param-info)) err-parameter-out-of-bounds)
+        (map-set contract-parameters param-name
+          (tuple 
+            (current-value new-value)
+            (min-value (get min-value param-info))
+            (max-value (get max-value param-info))
+            (last-updated stacks-block-height)
+            (update-count (+ (get update-count param-info) u1))))
+        (ok true)))))
+
+;; Treasury transfer execution
+(define-private (execute-treasury-transfer (parameters (list 5 uint)))
+  (let ((recipient-id (unwrap-panic (element-at parameters u0)))
+        (amount (unwrap-panic (element-at parameters u1)))
+        (recipient (if (is-eq recipient-id u1) contract-owner tx-sender)))
+    
+    ;; Validate inputs first
+    (asserts! (validate-amount amount) err-invalid-amount)
+    (asserts! (<= amount (var-get total-treasury-balance)) err-insufficient-funds)
+    
+    ;; Execute transfer and return immediately on failure
+    (try! (ft-transfer? trum-dao-token amount (as-contract tx-sender) recipient))
+    
+    ;; If we reach here, transfer succeeded
+    (var-set total-treasury-balance (- (var-get total-treasury-balance) amount))
+    (ok true)))
+
+;; Reward distribution execution
+(define-private (execute-reward-distribution (parameters (list 5 uint)))
+  (let ((pool-id (unwrap-panic (element-at parameters u0)))
+        (amount-per-user (unwrap-panic (element-at parameters u1))))
+    (asserts! (validate-amount amount-per-user) err-invalid-amount)
+    ;; Simplified reward distribution - in practice this would be more sophisticated
+    (let ((total-distribution (* amount-per-user u10))) ;; Assume 10 users for simplicity
+      (asserts! (<= total-distribution (var-get total-treasury-balance)) err-insufficient-funds)
+      (var-set total-treasury-balance (- (var-get total-treasury-balance) total-distribution))
+      (ok true))))
+
+;; Emergency action execution
+(define-private (execute-emergency-action (parameters (list 5 uint)))
+  (let ((emergency-type (unwrap-panic (element-at parameters u0))))
+    (if (is-eq emergency-type u1)
+        ;; Emergency unstaking enable
+        (begin
+          (var-set emergency-state true)
+          (ok true))
+        (if (is-eq emergency-type u2)
+            ;; Emergency unstaking disable
+            (begin
+              (var-set emergency-state false)
+              (ok true))
+            (err err-invalid-action-type)))))
+
+;; Staking parameter update execution
+(define-private (execute-staking-parameter-update (parameters (list 5 uint)))
+  (let ((param-type (unwrap-panic (element-at parameters u0)))
+        (new-value (unwrap-panic (element-at parameters u1))))
+    
+    ;; Validate first
+    (asserts! (or (is-eq param-type u1) (is-eq param-type u2)) err-invalid-action-type)
+    
+    ;; Both branches return (response bool uint)
+    (if (is-eq param-type u1)
+        (execute-parameter-update (list u1 new-value))
+        (execute-parameter-update (list u2 new-value)))))
 
 ;; ===== TIME-WEIGHTED VOTING FUNCTIONS =====
 ;; Calculate time-based voting weight
@@ -436,16 +673,6 @@
       
       (ok "All rewards distributed successfully"))))
 
-;; Proposal execution helper
-(define-private (execute-proposal-action (proposal (tuple (title (string-utf8 50)) (description (string-utf8 500)) (creator principal) (start-block uint) (end-block uint) (status (string-utf8 20)) (min-votes uint) (proposal-type (string-utf8 20)) (executable bool) (execution-data (optional (tuple (contract principal) (function-name (string-utf8 50)) (parameters (list 5 uint))))))))
-  (match (get execution-data proposal)
-    exec-data
-    (begin
-      ;; This would contain the actual contract call logic
-      ;; For now, we'll just mark it as executed
-      (ok true))
-    (ok true)))
-
 ;; Initialize default proposal types with time-weighted voting
 (define-private (init-proposal-types)
   (begin
@@ -672,28 +899,42 @@
           (execution-type execution-type)))
       (ok "Queued for execution"))))
 
-;; FIXED: Execute queued proposal with consistent return types
+;; ENHANCED: Execute queued proposal with dynamic execution
 (define-public (execute-queued-proposal (proposal-id uint))
   (begin
     (asserts! (> proposal-id u0) err-proposal-not-found)
     (let ((queue-item (unwrap! (map-get? execution-queue proposal-id) err-not-in-queue))
-          (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found)))
+          (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+          (vote-totals (unwrap! (map-get? proposal-vote-totals proposal-id) err-proposal-not-found)))
+      
+      ;; Validate execution conditions
       (asserts! (>= stacks-block-height (get execution-block queue-item)) err-execution-time-not-reached)
       (asserts! (not (get executed queue-item)) err-already-executed)
+      (asserts! (> (get votes-for vote-totals) (get votes-against vote-totals)) err-proposal-not-approved)
       
-      ;; FIXED: Execute proposal if executable, handle errors properly
-      (if (get executable proposal)
-          (begin
-            (unwrap! (execute-proposal-action proposal) err-execution-failed)
-            true)
-          true)
-      
-      ;; Mark as executed
-      (map-set execution-queue proposal-id (merge queue-item (tuple (executed true))))
-      (ok "Proposal executed"))))
+      ;; Try to execute the proposal
+      (let ((execution-result (if (get executable proposal)
+                                  (execute-proposal-action proposal)
+                                  (ok true))))
+        
+        ;; Always record the result and mark as executed
+        (map-set execution-results proposal-id
+          (tuple 
+            (proposal-id proposal-id)
+            (action-id (default-to u0 (get execution-action-id proposal)))
+            (success (is-ok execution-result))
+            (result-data (if (is-ok execution-result) 
+                            u"Execution completed successfully" 
+                            u"Execution failed"))
+            (executed-at stacks-block-height)))
+        
+        (map-set execution-queue proposal-id (merge queue-item (tuple (executed true))))
+        
+        ;; Return the execution result directly
+        execution-result))))
 
-;; ===== ENHANCED PROPOSAL SYSTEM (FIXED) =====
-(define-public (create-proposal (title (string-utf8 50)) (description (string-utf8 500)) (proposal-type (string-utf8 20)) (executable bool) (execution-data (optional (tuple (contract principal) (function-name (string-utf8 50)) (parameters (list 5 uint))))))
+;; ===== ENHANCED PROPOSAL SYSTEM =====
+(define-public (create-proposal (title (string-utf8 50)) (description (string-utf8 500)) (proposal-type (string-utf8 20)) (executable bool) (execution-action-id (optional uint)) (execution-parameters (list 5 uint)))
   (begin
     (asserts! (is-admin) err-not-authorized)
     (asserts! (validate-title title) err-invalid-string)
@@ -709,7 +950,12 @@
             (min-stake-required (get min-stake-required prop-type-info)))
         (asserts! (>= (get amount user-stake) min-stake-required) err-insufficient-stake))
       
-      ;; Create proposal
+      ;; Validate execution action if provided
+      (match execution-action-id
+        action-id (asserts! (is-some (map-get? execution-actions action-id)) err-action-not-found)
+        true)
+      
+      ;; Create proposal with enhanced execution data
       (map-set proposals proposal-id
         (tuple 
           (title title)
@@ -721,9 +967,10 @@
           (min-votes (get min-stake-required prop-type-info))
           (proposal-type proposal-type)
           (executable executable)
-          (execution-data execution-data)))
+          (execution-action-id execution-action-id)
+          (execution-parameters execution-parameters)))
       
-      ;; FIXED: Queue for execution if executable - check the response with try!
+      ;; Queue for execution if executable
       (try! (if executable
                 (queue-for-execution proposal-id (get execution-delay prop-type-info) u"auto")
                 (ok "Non-executable proposal")))
@@ -877,6 +1124,19 @@
 (define-read-only (get-emergency-state)
   (var-get emergency-state))
 
+;; NEW: Enhanced read-only functions for execution system
+(define-read-only (get-execution-action (action-id uint))
+  (map-get? execution-actions action-id))
+
+(define-read-only (get-contract-parameter (param-name (string-utf8 30)))
+  (map-get? contract-parameters param-name))
+
+(define-read-only (get-execution-result (proposal-id uint))
+  (map-get? execution-results proposal-id))
+
+(define-read-only (get-execution-queue-item (proposal-id uint))
+  (map-get? execution-queue proposal-id))
+
 ;; NEW: Time-weighted voting read-only functions
 (define-read-only (get-stake-history (user principal))
   (map-get? stake-history user))
@@ -899,4 +1159,6 @@
 
 ;; Initialize the contract
 (begin
-  (init-proposal-types))
+  (init-proposal-types)
+  (init-execution-actions)
+  (init-contract-parameters))
